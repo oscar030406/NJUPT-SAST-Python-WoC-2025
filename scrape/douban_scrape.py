@@ -1,147 +1,108 @@
-import json
-import os
-import re
-import time
+﻿import json
 import logging
-from os import makedirs
-from os.path import exists
+import os
+import time
 
 import requests
-from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s: %(message)s')
 
-BASE_URL = 'https://movie.douban.com/top250'
+BASE_URL = 'https://m.douban.com/rexxar/api/v2/subject_collection/movie_top250/items'
 TOTAL_PAGE = 10
+PAGE_SIZE = 25
+TIMEOUT = 8
+MAX_RETRIES = 3
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                  'AppleWebKit/537.36 (KHTML, like Gecko) '
-                  'Chrome/122.0.0.0 Safari/537.36',
-    'Referer': 'https://movie.douban.com/',
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)',
+    'Referer': 'https://m.douban.com/subject_collection/movie_top250',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept': 'application/json, text/plain, */*',
 }
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'douban_top250')
-exists(RESULTS_DIR) or makedirs(RESULTS_DIR)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# 复用 TCP 连接，避免每次请求都重新进行 DNS 查询和 TCP/TLS 握手
+session = requests.Session()
+session.headers.update(HEADERS)
 
 
 def scrape_page(url, params=None):
-    logging.info('scraping %s...', url)
-    try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if response.status_code == 200:
-            return response.text
-        logging.error('get invalid status code %s while scraping %s',
-                      response.status_code, url)
-    except requests.RequestException:
-        logging.error('error occurred while scraping %s', url, exc_info=True)
+    logging.debug('scraping %s...', url)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(url, params=params, timeout=TIMEOUT)
+            if response.status_code == 200:
+                return response.json()
+            logging.warning('attempt %d/%d: status %s for %s',
+                            attempt, MAX_RETRIES, response.status_code, url)
+        except requests.RequestException:
+            logging.warning('attempt %d/%d: request failed for %s',
+                            attempt, MAX_RETRIES, url, exc_info=True)
+        if attempt < MAX_RETRIES:
+            time.sleep(0.5 * attempt)  # 指数退避，避免连续失败时频繁请求
+    logging.error('all %d attempts failed for %s', MAX_RETRIES, url)
+    return None
 
 
 def scrape_index(page):
-    start = (page - 1) * 25
-    return scrape_page(BASE_URL, params={'start': start})
+    start = (page - 1) * PAGE_SIZE
+    return scrape_page(BASE_URL, params={'start': start, 'count': PAGE_SIZE})
 
 
-def parse_index(html):
-    """Parse Douban Top250 page HTML and extract movie info.
-
-    Args:
-        html: HTML source of a Douban Top250 listing page.
-
-    Yields:
-        dict with keys: rank, title, director, actors, year,
-        country, genre, rating, votes, quote, url.
-    """
-    soup = BeautifulSoup(html, 'lxml')
-    items = soup.find_all('div', class_='item')
+def parse_index(data):
+    items = data.get('subject_collection_items') or []
     if not items:
-        return 
-    director_pattern = re.compile(r'导演:\s*(.+?)(?:\s+主演:|$)')
-    actors_pattern = re.compile(r'主演:\s*(.+)')
+        return
+
     for item in items:
-        hd = item.find('div', class_='hd')
-        bd = item.find('div', class_='bd')
-        pic = item.find('div', class_='pic')
-
-        rank_em = pic.find('em') if pic else None
-        rank = rank_em.get_text(strip=True) if rank_em else None
-
-        link = hd.find('a') if hd else None
-        url = link['href'] if link else None
-
-        title_span = hd.find('span', class_='title') if hd else None
-        title = title_span.get_text(strip=True) if title_span else None
-
-        info_p = bd.find('p') if bd else None
-        info_text = info_p.get_text('\n', strip=True) if info_p else ''
-        lines = [l.strip() for l in info_text.split('\n') if l.strip()]
-
-        director = actors = year = country = genre = None
-        if lines:
-            first = lines[0]
-            m = re.search(director_pattern, first)
-            if m:
-                director = m.group(1).strip().rstrip('...')
-            m2 = re.search(actors_pattern, first)
-            if m2:
-                actors = m2.group(1).strip().rstrip('...')
-
-        if len(lines) > 1:
-            parts = [p.strip() for p in lines[-1].split('/')]
-            if parts:
-                year = re.sub(r'[^\d]', '', parts[0])
-            if len(parts) > 1:
-                country = parts[1].strip()
-            if len(parts) > 2:
-                genre = parts[2].strip()
-
-        rating_span = bd.find('span', class_='rating_num') if bd else None
-        rating = float(rating_span.get_text(strip=True)) if rating_span else None
-
-        votes = None
-        if bd:
-            for span in bd.find_all('span'):
-                if '人评价' in span.get_text():
-                    votes = span.get_text(strip=True).replace('人评价', '')
-                    break
-
-        quote_p = bd.find('p', class_='quote') if bd else None
-        quote_span = quote_p.find('span') if quote_p else None
-        quote = quote_span.get_text(strip=True) if quote_span else None
+        subtitle = item.get('card_subtitle', '')
+        parts = [part.strip() for part in subtitle.split('/') if part.strip()]
+        rating_info = item.get('rating') or {}
+        year = parts[0] if len(parts) > 0 else ''
+        country = parts[1] if len(parts) > 1 else ''
+        genre = parts[2] if len(parts) > 2 else ''
+        director = parts[3] if len(parts) > 3 else ''
+        actors = parts[4] if len(parts) > 4 else ''
 
         yield {
-            'rank': rank, 'title': title, 'director': director,
-            'actors': actors, 'year': year, 'country': country,
-            'genre': genre, 'rating': rating, 'votes': votes,
-            'quote': quote, 'url': url
+            'rank': str(item.get('rank', '')),
+            'title': item.get('title', ''),
+            'director': director,
+            'actors': actors,
+            'year': year,
+            'country': country,
+            'genre': genre,
+            'rating': rating_info.get('value'),
+            'votes': rating_info.get('count'),
+            'quote': item.get('description', ''),
+            'url': item.get('url', ''),
         }
 
 
 def save_data(data):
-    name = data.get('title')
-    data_path = f'{RESULTS_DIR}/{name}.json'
-    json.dump(data, open(data_path, 'w', encoding='utf-8'),
-              ensure_ascii=False, indent=2)
+    name = data.get('title') or data.get('rank') or 'movie'
+    # Replace invalid Windows filename characters.
+    safe_name = ''.join('_' if char in '\\/:*?"<>|' else char for char in name)
+    data_path = f'{RESULTS_DIR}/{safe_name}.json'
+    with open(data_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def main(page):
-    index_html = scrape_index(page)
-    if not index_html:
+    index_data = scrape_index(page)
+    if not index_data:
         return
-    movies = parse_index(index_html)
+    movies = parse_index(index_data)
     for movie in movies:
-        logging.info('get movie data %s', movie)
-        logging.info('saving data to json file')
         save_data(movie)
-        logging.info('data saved successfully')
 
 
 if __name__ == '__main__':
-    t_start = time.time()
+    t_start = time.perf_counter()
     for page in range(1, TOTAL_PAGE + 1):
         main(page)
-        time.sleep(1)
-    elapsed = time.time() - t_start
+    elapsed = time.perf_counter() - t_start
     logging.info('serial scraping done: %d pages, elapsed %.2fs',
                  TOTAL_PAGE, elapsed)
