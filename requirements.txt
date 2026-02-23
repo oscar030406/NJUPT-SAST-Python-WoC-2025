@@ -3,3 +3,4 @@ requests
 aiohttp
 lxml
 selenium
+scrapy
