@@ -1,12 +1,15 @@
 ﻿import json
 import logging
-import os
 import time
+from pathlib import Path
 
 import requests
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s: %(message)s')
+#%(asctime)s：时间
+#%(levelname)s：日志级别，比如 DEBUG、INFO、WARNING、ERROR
+#%(message)s：日志内容
 
 BASE_URL = 'https://m.douban.com/rexxar/api/v2/subject_collection/movie_top250/items'
 TOTAL_PAGE = 10
@@ -19,30 +22,29 @@ HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     'Accept': 'application/json, text/plain, */*',
 }
+RESULTS_DIR = Path(__file__).resolve().parent.parent / 'data' / 'douban_top250'
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'douban_top250')
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# 复用 TCP 连接，避免每次请求都重新进行 DNS 查询和 TCP/TLS 握手
+# 复用 HTTP 会话和底层连接，减少重复建立 TCP/TLS 连接的开销
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
 def scrape_page(url, params=None):
-    logging.debug('scraping %s...', url)
+    logging.debug('开始请求接口：%s', url)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = session.get(url, params=params, timeout=TIMEOUT)
             if response.status_code == 200:
                 return response.json()
-            logging.warning('attempt %d/%d: status %s for %s',
+            logging.warning('第 %d/%d 次请求返回状态码 %s，接口：%s',
                             attempt, MAX_RETRIES, response.status_code, url)
         except requests.RequestException:
-            logging.warning('attempt %d/%d: request failed for %s',
+            logging.warning('第 %d/%d 次请求失败，接口：%s',
                             attempt, MAX_RETRIES, url, exc_info=True)
         if attempt < MAX_RETRIES:
-            time.sleep(0.5 * attempt)  # 指数退避，避免连续失败时频繁请求
-    logging.error('all %d attempts failed for %s', MAX_RETRIES, url)
+            time.sleep(0.5 * attempt) 
+    logging.error('接口连续失败 %d 次：%s', MAX_RETRIES, url)
     return None
 
 
@@ -83,10 +85,10 @@ def parse_index(data):
 
 def save_data(data):
     name = data.get('title') or data.get('rank') or 'movie'
-    # Replace invalid Windows filename characters.
+   # 将 Windows 文件名中不允许的字符替换为下划线。
     safe_name = ''.join('_' if char in '\\/:*?"<>|' else char for char in name)
-    data_path = f'{RESULTS_DIR}/{safe_name}.json'
-    with open(data_path, 'w', encoding='utf-8') as f:
+    data_path = RESULTS_DIR / f'{safe_name}.json'
+    with data_path.open('w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -104,5 +106,5 @@ if __name__ == '__main__':
     for page in range(1, TOTAL_PAGE + 1):
         main(page)
     elapsed = time.perf_counter() - t_start
-    logging.info('serial scraping done: %d pages, elapsed %.2fs',
+    logging.info('串行爬取完成，共 %d 页，耗时 %.2f 秒',
                  TOTAL_PAGE, elapsed)

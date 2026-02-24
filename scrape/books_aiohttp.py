@@ -1,16 +1,14 @@
 import asyncio
 import csv
 import logging
-import os
 import re
 import time
+from pathlib import Path
 import aiohttp
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s: %(message)s')
-
-# Dangdang bestseller books - async scraper (aiohttp + bs4)
 
 BASE_URL = 'http://bang.dangdang.com/books/bestsellers/01.00.00.00.00.00-recent7-0-0-1-{}'
 HEADERS = {
@@ -19,15 +17,15 @@ HEADERS = {
                   'Chrome/122.0.0.0 Safari/537.36'
 }
 MAX_PAGES = 5
-CONCURRENCY = 5
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
-CSV_FILE = os.path.join(DATA_DIR, 'dangdang_aiohttp.csv')
+CONCURRENCY = 10
+MAX_RETRIES = 3
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
+CSV_FILE = DATA_DIR / 'dangdang_aiohttp.csv'
 CSV_FIELDS = ['rank', 'title', 'author', 'publisher', 'date',
               'price', 'original_price', 'discount', 'comments',
               'recommendation', 'url']
 
-
-
+#内部函数：将文本转换为浮点数
 def _safe_float(text):
     try:
         return float(text) if text else 0.0
@@ -47,7 +45,7 @@ def parse_item(li):
     title = a_tag.get('title', a_tag.get_text(strip=True)) if a_tag else ''
     url = a_tag.get('href', '') if a_tag else ''
 
-    # publisher info
+    # publisher
     pub_divs = li.find_all('div', class_='publisher_info')
     author = pub_date = publisher = ''
     if pub_divs:
@@ -98,27 +96,36 @@ def parse_item(li):
 async def fetch_page(session, page, sem):
     url = BASE_URL.format(page)
     async with sem:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                resp.raise_for_status()
-                raw = await resp.read()
-                html = raw.decode('gb2312', errors='replace')
-                soup = BeautifulSoup(html, 'lxml')
-                bang = soup.find('ul', class_='bang_list')
-                items = bang.find_all('li') if bang else []
-                books = [parse_item(li) for li in items]
-                logging.info('page=%s fetched %d books', page, len(books))
-                await asyncio.sleep(0.15)
-                return books
-        except Exception:
-            logging.error('page=%s request failed', page, exc_info=True)
-            return []
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    raw = await resp.read()
+                    html = raw.decode('gb2312', errors='replace')
+                    soup = BeautifulSoup(html, 'lxml')
+                    bang = soup.find('ul', class_='bang_list')
+                    items = bang.find_all('li') if bang else []
+                    books = [parse_item(li) for li in items]
+                    logging.info('第 %s 页抓取到 %d 本书', page, len(books))
+                    return books
+            except Exception:
+                logging.warning('第 %s 页第 %d/%d 次抓取失败',
+                                page, attempt, MAX_RETRIES, exc_info=True)
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(0.3 * attempt)
+        logging.error('第 %s 页连续失败 %d 次', page, MAX_RETRIES)
+        return []
 
 
 async def scrape_all():
+    # 信号量：限制同时运行的并发协程数，防止过多请求触发限流
     sem = asyncio.Semaphore(CONCURRENCY)
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
+    timeout = aiohttp.ClientTimeout(total=8)
+    # TCP 连接池：全局及单主机最大连接数均为 CONCURRENCY，DNS 缓存 300 秒
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
         tasks = [fetch_page(session, p, sem) for p in range(1, MAX_PAGES + 1)]
+        # 并发调度所有任务，等待全部完成
         results = await asyncio.gather(*tasks)
     books = []
     for page_books in results:
@@ -127,20 +134,20 @@ async def scrape_all():
 
 
 def save_csv(books, filepath):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with filepath.open('w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(books)
-    logging.info('saved %d records -> %s', len(books), filepath)
+    logging.info('已保存 %d 条记录到 %s', len(books), filepath)
 
 
 async def main():
-    logging.info('Dangdang bestseller async scrape, %d pages', MAX_PAGES)
+    logging.info('开始抓取当当畅销榜，共 %d 页', MAX_PAGES)
     t_start = time.time()
     books = await scrape_all()
     elapsed = time.time() - t_start
-    logging.info('async scraping done: %d books, elapsed %.2fs', len(books), elapsed)
+    logging.info('抓取完成，共 %d 本书，耗时 %.2f 秒', len(books), elapsed)
     save_csv(books, CSV_FILE)
 
 

@@ -1,15 +1,14 @@
 import csv
 import logging
-import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s: %(message)s')
-
-# Dangdang bestseller books - sync scraper (requests + bs4)
 
 BASE_URL = 'http://bang.dangdang.com/books/bestsellers/01.00.00.00.00.00-recent7-0-0-1-{}'
 HEADERS = {
@@ -18,8 +17,10 @@ HEADERS = {
                   'Chrome/122.0.0.0 Safari/537.36'
 }
 MAX_PAGES = 5
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
-CSV_FILE = os.path.join(DATA_DIR, 'dangdang_requests.csv')
+WORKERS = 5
+MAX_RETRIES = 3
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
+CSV_FILE = DATA_DIR / 'dangdang_requests.csv'
 CSV_FIELDS = ['rank', 'title', 'author', 'publisher', 'date',
               'price', 'original_price', 'discount', 'comments',
               'recommendation', 'url']
@@ -32,17 +33,28 @@ def _safe_float(text):
         return 0.0
 
 
+# 复用 HTTP 会话和底层连接，减少重复建立 TCP/TLS 连接的开销
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
 def scrape_page(url):
-    logging.info('scraping %s...', url)
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code == 200:
-            response.encoding = 'gb2312'
-            return response.text
-        logging.error('get invalid status code %s while scraping %s',
-                      response.status_code, url)
-    except requests.RequestException:
-        logging.error('error occurred while scraping %s', url, exc_info=True)
+    logging.info('开始抓取页面：%s', url)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=10)
+            if response.status_code == 200:
+                response.encoding = 'gb2312'
+                return response.text
+            logging.warning('第 %d/%d 次请求返回状态码 %s，页面：%s',
+                            attempt, MAX_RETRIES, response.status_code, url)
+        except requests.RequestException:
+            logging.warning('第 %d/%d 次抓取失败，页面：%s',
+                            attempt, MAX_RETRIES, url, exc_info=True)
+        if attempt < MAX_RETRIES:
+            time.sleep(0.5 * attempt)
+    logging.error('页面抓取连续失败 %d 次：%s', MAX_RETRIES, url)
+    return None
 
 
 def scrape_index(page):
@@ -69,7 +81,7 @@ def parse_index(html):
         title = a_tag.get('title', a_tag.get_text(strip=True)) if a_tag else ''
         url = a_tag.get('href', '') if a_tag else ''
 
-        # publisher info
+        # publisher
         pub_divs = li.find_all('div', class_='publisher_info')
         author = pub_date = publisher = ''
         if pub_divs:
@@ -118,12 +130,12 @@ def parse_index(html):
 
 
 def save_data(books):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CSV_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with CSV_FILE.open('w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(books)
-    logging.info('saved %d records -> %s', len(books), CSV_FILE)
+    logging.info('已保存 %d 条记录到 %s', len(books), CSV_FILE)
 
 
 def main(page):
@@ -131,18 +143,29 @@ def main(page):
     if not index_html:
         return []
     books = list(parse_index(index_html))
-    logging.info('page %d: got %d books', page, len(books))
+    logging.info('第 %d 页抓取到 %d 本书', page, len(books))
     return books
 
 
 if __name__ == '__main__':
-    logging.info('Dangdang bestseller sync scrape, %d pages', MAX_PAGES)
+    logging.info('开始抓取，共 %d 页', MAX_PAGES)
     t_start = time.time()
+    page_books = {}
+    # 创建线程池，线程数不超过设定值，也不超过实际要抓取的页数。
+    with ThreadPoolExecutor(max_workers=min(WORKERS, MAX_PAGES)) as executor:
+        futures = {
+            # 把 main(page) 交给线程池执行，返回 future 句柄。
+            executor.submit(main, page): page
+            for page in range(1, MAX_PAGES + 1)
+        }
+        # 按任务实际完成的先后顺序依次取回结果，而不是按页码顺序等待。
+        for future in as_completed(futures):
+            page = futures[future]
+            page_books[page] = future.result()
+
     all_books = []
     for page in range(1, MAX_PAGES + 1):
-        books = main(page)
-        all_books.extend(books)
-        time.sleep(0.5)
+        all_books.extend(page_books.get(page, []))
     elapsed = time.time() - t_start
-    logging.info('sync scraping done: %d books, elapsed %.2fs', len(all_books), elapsed)
+    logging.info('抓取完成，共 %d 本书，耗时 %.2f 秒', len(all_books), elapsed)
     save_data(all_books)
