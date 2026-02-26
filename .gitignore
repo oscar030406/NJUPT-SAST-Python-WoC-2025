@@ -33,3 +33,8 @@ venv/
 .vscode/
 *.swp
 *.swo
+
+# Large local artifacts generated during experiments
+data/*.mp4
+data/*.avi
+data/*.mov
